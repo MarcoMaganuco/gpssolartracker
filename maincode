@@ -1,0 +1,1405 @@
+
+
+/*
+  SD CARD Pins: Check for SPI pins for arduino mega
+  MOSI:51
+  MISO:50
+  SCK:52
+  CS:53
+*/
+/*
+   Sensor housing wiring: on cat 5 connector
+   VCC=6
+   GND=4
+   TX(on module)=5--->19 (on arduino)
+   RX(on module)=3---->18(on arduino)
+   DHT=center pin-->8---->7(on Arduino)
+   Light sensor= 7---> A5
+*/
+/*
+   The motor controller wiring
+   Elevation motor control: Module-->cat5 number-->Board
+   RPWM-->4-->3
+   LPWM-->5-->4
+   R_EN-->8-->5
+   L_EN-->7-->6
+
+   Azimuth Motor control:  AZI High LPWM extends the actuator
+   RPWM-->6-->8
+   LPWM-->3-->9
+   R_EN-->2-->10
+   L_EN-->1-->11
+*/
+/*
+  RTC pins:
+  SCL: 21
+  SDA:20
+*/
+/*
+  DHT pins:
+  OUT: 2
+*/
+/*
+   GPS pins:
+   TX on module ---> Rx on Arduino
+   Rx on module----> Tx on arduino
+   pin 18 (TX arduino mega)
+   pin 19 (Rx on arduino mega)
+*/
+
+/*
+   Accelerometer pins:
+   xpin=A1
+   ypin=A2
+   zpin=A3
+*/
+/*
+ * Power meter circuits
+ * 12volt in
+ * current pin--->1--->A8
+ * Voltage pin--->2--->A9
+ * 
+ * 35 volt stationary panel
+ * current--4--->A11
+ * Voltage->6--->A13
+ * 
+ * 35 volt rotational panel
+ * current-->5-->A12
+ * Voltage-->A10
+ * 
+ */
+#include <SimpleTimer.h>
+#include <SD.h>
+#include <SPI.h>
+#include <SFE_BMP180.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <Servo.h>
+#include <TinyGPS++.h>
+#include <Wire.h>
+#include <SoftwareSerial.h>
+#include <TimeLib.h>
+#include <DS3231.h>
+#include <DS1307RTC.h>
+#include <SolarPosition.h>
+
+#define DS3231_I2C_ADDRESS 0x68
+#define BMP180_I2C_ADDRESS 0X77
+#define STOP 23// this button can be pressed to stop the movemet of the actuators
+#define ALTITUDE 1 //Altitude of San Diego State University in meters
+#define TIMEZONE 0//UTC offset. 
+
+//following is for the data logger chip select pin
+#define chipSelect 53 //SD card CS pin connected to pin 53 of Arduino mega
+
+//the following is for the DHT sensor
+#define DHTPIN 2     // what pin The data pin of the DHT 22 is connected
+#define DHTTYPE DHT22   // Defining the type of DHT for the DHT library to work
+
+//The following define the pins for the elevation  motor driver     the actuators in this project have a duty cycle of 25% or analogWrite(Elev_RPWM_Output,64)
+#define Elev_RPWM_Output 3// This is the PWM pin used to control the speed of the actuator in the R direction
+#define Elev_LPWM_Output 4//This is the PWM pin used to control the speed of the actuator in the L direction
+#define Elev_R_EN 5// this pin makes it so the motor controller is "turned on" in the R direction
+#define Elev_L_EN 6// this pin makes it so the motor controller is "turned on" in the L direction
+
+#define Azi_RPWM_Output 8
+#define Azi_LPWM_Output 9
+#define Azi_R_EN 10
+#define Azi_L_EN 11
+
+#define volt_current A8
+#define volt_voltage A9
+#define rotational_voltage A13
+#define rotational_current A11
+#define stationary_current A12
+#define stationary_voltage A10
+
+
+int gpsChkSum, rtcChkSum;
+bool    Stop_button = 0;
+//shared data structure definition
+struct measured_pos {
+  int measured_azimuth;
+  int  measured_elevation;
+};
+struct measured_pos A;// global structure instance
+
+struct PRESSURE {
+  double Pressure;
+  double Temperature;
+};
+struct PRESSURE Z;
+
+struct POWER {
+  float voltage_12volt;
+  float current_12volt;
+
+  float voltage_stationary;
+  float current_stationary;
+
+  float voltage_rotational;
+  float current_rotational;
+};
+struct POWER B;
+
+SimpleTimer firstTimer(60000);
+bool flag = false;
+
+SolarPosition SDSU(32.777225, -117.070439);  // SDSU GPS Location (SDSU is somePosition) object I havent figured out how to update this position from the GPS for now it is manually input in the code.
+static const int Rx = 19, Tx = 18;
+static const uint32_t GPSBaud = 9600;
+
+const uint8_t digits = 3; // number of decimal digits to print
+
+/*
+   Credit for this section of code goes to SolarDuino
+   https://solarduino.com/diy-dc-energy-meter-with-arduino/
+*/
+
+/* 0- General */
+
+int decimalPrecision = 3;                   // decimal places for all values shown in LED Display & Serial Monitor
+float divide = 0;
+/* 1- DC Voltage Measurement using Voltage Divider Method */
+
+
+float voltageSampleRead12volt = 0 ;                 /* to read the value of a sample*/
+float voltageLastSample12volt = 0;                  /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+long voltageSampleSum12volt = 0   ;                 /* accumulation of sample readings */
+float voltageSampleCount12volt = 0 ;                /* to count number of sample. */
+float voltageMean12volt = 0 ;                       /* to calculate the average value from all samples*/
+float moduleSupplyVoltageV12volt = 12.1;          /* maximum measuring voltage , default 5V*/
+float finalVoltage12volt = 0;                     /*shows the final voltage reading*/
+
+float voltageSampleRead_stationary  = 0;               /* to read the value of a sample*/
+float voltageLastSample_stationary  = 0;               /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+long voltageSampleSum_stationary   = 0;               /* accumulation of sample readings */
+float voltageSampleCount_stationary = 0;               /* to count number of sample. */
+float voltageMean_stationary ;                         /* to calculate the average value from all samples*/
+float moduleSupplyVoltageV_stationary = 35;
+float finalVoltage_stationary = 0;                     /*shows the final voltage reading*/
+
+float voltageSampleRead_rotational  = 0;               /* to read the value of a sample*/
+float voltageLastSample_rotational  = 0;               /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+long voltageSampleSum_rotational   = 0;               /* accumulation of sample readings */
+float voltageSampleCount_rotational = 0;               /* to count number of sample. */
+float voltageMean_rotational ;                         /* to calculate the average value from all samples*/
+float moduleSupplyVoltageV_rotational = 35;
+float finalVoltage_rotational = 0;                     /*shows the final voltage reading*/
+
+
+/* 2- DC Current Measurement */
+
+//#define volt_current A8 ;             // Which pin to measure Current Value (A0 is reserved for LCD Shield buttons function)
+float mVperAmpValue = 100;                  // If using ACS712 current module : for 5A module key in 185, for 20A module key in 100, for 30A module key in 66
+// If using "Hall-Effect" Current Transformer, key in value using this formula: mVperAmp = maximum voltage range (in milli volt) / current rating of CT
+/* For example, a 20A Hall-Effect Current Transformer rated at 20A, 2.5V +/- 0.625V, mVperAmp will be 625 mV / 20A = 31.25mV/A */
+
+float moduleMiddleVoltage = 2500;           /* when there is no reading, the voltage is at middle Vcc. For 5V power supply, the middle voltage is 2500mV;*/
+float moduleSupplyVoltage = 5000;           /* supply voltage to current sensor module, default 5000mV*/
+float currentSampleRead12volt  = 0;               /* to read the value of a sample*/
+float currentLastSample12volt  = 0;               /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+float currentSampleSum12volt   = 0;               /* accumulation of sample readings */
+float currentSampleCount12volt = 0;               /* to count number of sample. */
+float currentMean12volt ;                         /* to calculate the average value from all samples*/
+float finalCurrent12volt ;                        /* the final current reading without adding offset value*/
+float finalCurrent212volt ;                       /* the final current reading*/
+
+float currentSampleRead_stationary  = 0;               /* to read the value of a sample*/
+float currentLastSample_stationary  = 0;               /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+float currentSampleSum_stationary   = 0;               /* accumulation of sample readings */
+float currentSampleCount_stationary = 0;               /* to count number of sample. */
+float currentMean_stationary ;                         /* to calculate the average value from all samples*/
+float finalCurrent_stationary ;                        /* the final current reading without adding offset value*/
+float finalCurrent2_stationary ;                       /* the final current reading*/
+
+float currentSampleRead_rotational  = 0;               /* to read the value of a sample*/
+float currentLastSample_rotational  = 0;               /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+float currentSampleSum_rotational   = 0;               /* accumulation of sample readings */
+float currentSampleCount_rotational = 0;               /* to count number of sample. */
+float currentMean_rotational ;                         /* to calculate the average value from all samples*/
+float finalCurrent_rotational ;                        /* the final current reading without adding offset value*/
+float finalCurrent2_rotational ;                       /* the final current reading*/
+
+/* 2.1- DC Current Offset */
+
+int OffsetRead12volt = 0;                   /* To switch between functions for auto callibation purpose */
+float currentOffset12volt = -0.01 ;          // to Offset deviation and accuracy. Offset any fake current when no current operates.
+                                            // Look into serial monitor to add or minus the value.
+                                            // 0.26 means add 0.26A to all current measured value.
+                                            /* if you have LCD Display Shield, this offset can be automatically adjusted by pressing SELECT button */
+float offsetLastSample12volt = 0;           /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+float offsetSampleCount12volt = 0;          /* to count number of sample. */
+
+int OffsetRead_rotational = 0;                   /* To switch between functions for auto callibation purpose */
+float currentOffset_rotational = -0.01 ;          // to Offset deviation and accuracy. Offset any fake current when no current operates.
+                                                  // Look into serial monitor to add or minus the value.
+                                                  // 0.26 means add 0.26A to all current measured value.
+                                                  /* if you have LCD Display Shield, this offset can be automatically adjusted by pressing SELECT button */
+float offsetLastSample_rotational = 0;           /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+float offsetSampleCount_rotational = 0;          /* to count number of sample. */
+
+int OffsetRead_stationary = 0;                   /* To switch between functions for auto callibation purpose */
+float currentOffset_stationary = -0.01 ;          // to Offset deviation and accuracy. Offset any fake current when no current operates.
+                                                  // Look into serial monitor to add or minus the value.
+                                                  // 0.26 means add 0.26A to all current measured value.
+                                                  /* if you have LCD Display Shield, this offset can be automatically adjusted by pressing SELECT button */
+float offsetLastSample_stationary = 0;           /* to count time for each sample. Technically 1 milli second 1 sample is taken */
+float offsetSampleCount_stationary = 0;          /* to count number of sample. */
+/* 3- DC Power Wattage calculation */
+
+float PowerValue12volt = 0;                         /* Initial calculation Power Value */
+unsigned long startMillisPower12volt;               /* start counting time for power */
+unsigned long currentMillisPower12volt;             /* current counting time for power */
+const unsigned long periodPower12volt = 1000;       // refresh every X seconds (in seconds) Default 1 = 1 second
+
+float PowerValue_stationary = 0;                         /* Initial calculation Power Value */
+unsigned long startMillisPower_stationary;               /* start counting time for power */
+unsigned long currentMillisPower_stationary;             /* current counting time for power */
+const unsigned long periodPower_stationary = 1000;       // refresh every X seconds (in seconds) Default 1 = 1 second
+
+float PowerValue_rotational = 0;                         /* Initial calculation Power Value */
+unsigned long startMillisPower_rotational;               /* start counting time for power */
+unsigned long currentMillisPower_rotational;             /* current counting time for power */
+const unsigned long periodPower_rotational = 1000;       // refresh every X seconds (in seconds) Default 1 = 1 second
+
+/* 4- DC Watt-hour calculation */
+
+float wattHour12volt  = 0;                           /* Initial calculation Energy Value */
+unsigned long startMillisEnergy12volt;               /* start counting time for Energy */
+unsigned long currentMillisEnergy12volt;             /* current counting time for Energy */
+const unsigned long periodEnergy12volt = 1000;       // refresh every X seconds (in seconds) Default 1000 = 1 second
+float FinalEnergyValue12volt = 0;                    /*shows the final Energy reading*/
+
+float wattHour_stationary  = 0;                           /* Initial calculation Energy Value */
+unsigned long startMillisEnergy_stationary;               /* start counting time for Energy */
+unsigned long currentMillisEnergy_stationary;             /* current counting time for Energy */
+const unsigned long periodEnergy_stationary = 1000;       // refresh every X seconds (in seconds) Default 1000 = 1 second
+float FinalEnergyValue_stationary = 0;                    /*shows the final Energy reading*/
+
+float wattHour_rotational  = 0;                           /* Initial calculation Energy Value */
+unsigned long startMillisEnergy_rotational;               /* start counting time for Energy */
+unsigned long currentMillisEnergy_rotational;             /* current counting time for Energy */
+const unsigned long periodEnergy_rotational = 1000;       // refresh every X seconds (in seconds) Default 1000 = 1 second
+float FinalEnergyValue_rotational = 0;                    /*shows the final Energy reading*/
+// The TinyGPS++ object
+TinyGPSPlus gps;
+
+SFE_BMP180 pressure;
+// The serial connection to the GPS device
+SoftwareSerial gpss(Rx, Tx);
+
+DHT dht(DHTPIN, DHTTYPE); // Initialize DHT sensor for normal 16mhz Arduino
+/**********************************************************************************************
+    This is for the Panel position Sensor
+************************************************************************************************/
+void Read_accel() {
+  //Serial.println("Read_accel function");
+  //set up for accelerometer
+  const int xPin   = A1;
+  const int yPin   = A2;
+  const int zPin   = A3;
+
+  //averaging the x,y,and z values to reduce noise.
+  //averaging the x,y,and z values to reduce noise.
+  long x = 0;
+  int amount = 100; //read the value 100 times then divide to reduce noise
+  //x = analogRead(xPin);
+  for (int i = 0; i < amount; i++) {
+    x = x + analogRead(xPin);
+  }
+  x = (x / (amount + 1));
+
+
+  long y = 0;
+  //y = analogRead(yPin);
+  for (int i = 0; i < amount; i++) {
+    y = y + analogRead(yPin);
+  }
+  y = (y / (amount + 1));
+
+  long z = 0;
+  //z = analogRead(zPin);
+  for (int i = 0; i < amount; i++) {
+    z = z + analogRead(zPin);
+  }
+  z = (z / (amount + 1));
+  /**********************************************
+     With the GY-61 mounted on the center bar, with GY-61 facing up and the wiring pins facing "south"
+   ***********************************************/
+  // You can put the module in 4 directions to determine the min-max-values:
+  // –>    Sunset         x = 360  y = 287  z = 319
+  // /\    Flat to sky    x = 332  y = 337  z = 303
+  // <–    Sunrise        x = 293  y = 295  z = 334
+  //
+  // This can be used to measure degrees
+  //fully contracted the solar panel faces 34 degrees elevation and 84 degrees azimuth this is the morning position
+  //sunset position  38 elevation and 257 azimuth
+  //// show angle
+
+  int elevation_constrained = constrain(map(y, 287, 337, 34, 87), 0, 90);
+  int azimuth_constrained = constrain(map(x, 293, 360, 84, 257), 90, 270);
+  A.measured_azimuth = azimuth_constrained;
+  A.measured_elevation = elevation_constrained;
+  return A;
+}
+/**********************************************************************************************
+     Getting the pressure Data from BMP-180
+ ************************************************************************************************/
+void get_pressure_data() {
+  char status;
+  double T, P, p0, a;
+  status = pressure.startTemperature();
+  if (status != 0)
+  {
+    // Wait for the measurement to complete:
+    delay(status);
+
+    // Retrieve the completed temperature measurement:
+    // Note that the measurement is stored in the variable T.
+    // Function returns 1 if successful, 0 if failure.
+
+    status = pressure.getTemperature(T);
+    if (status != 0)
+    {
+      // Print out the measurement:
+      //      Serial.print("BMP-180 Temp: ");
+      //      Serial.print(T,2);
+      //      Serial.print(" deg C, ");
+      //      Serial.print((9.0/5.0)*T+32.0,2);
+      //      Serial.print(" deg F");
+      //      Serial.print("\t");
+
+      // Start a pressure measurement:
+      // The parameter is the oversampling setting, from 0 to 3 (highest res, longest wait).
+      // If request is successful, the number of ms to wait is returned.
+      // If request is unsuccessful, 0 is returned.
+
+      status = pressure.startPressure(3);
+      if (status != 0)
+      {
+        // Wait for the measurement to complete:
+        delay(status);
+
+        // Retrieve the completed pressure measurement:
+        // Note that the measurement is stored in the variable P.
+        // Note also that the function requires the previous temperature measurement (T).
+        // (If temperature is stable, you can do one temperature measurement for a number of pressure measurements.)
+        // Function returns 1 if successful, 0 if failure.
+
+        status = pressure.getPressure(P, T);
+        if (status != 0)
+        {
+          // Print out the measurement:
+          //          Serial.print("absolute pressure: ");
+          //          Serial.print(P,2);
+          //          Serial.print(" mb, ");
+          //          Serial.print(P*0.0295333727,2);
+          //          Serial.println(" inHg");
+          Z.Pressure = (P, 2);
+
+
+          // The pressure sensor returns abolute pressure, which varies with altitude.
+          // To remove the effects of altitude, use the sealevel function and your current altitude.
+          // This number is commonly used in weather reports.
+          // Parameters: P = absolute pressure in mb, ALTITUDE = current altitude in m.
+          // Result: p0 = sea-level compensated pressure in mb
+
+          // p0 = pressure.sealevel(P,ALTITUDE); // 152.4 meters at SDSU
+
+        }
+        else Serial.println("error retrieving pressure measurement\n");
+      }
+      else Serial.println("error starting pressure measurement\n");
+
+    }
+  }
+}
+/**********************************************************************************************
+    Print a solar position to serial
+************************************************************************************************/
+void printSolarPosition(SolarPosition_t pos, int numDigits) {
+  //  Serial.print(F("Calculated elevation: "));
+  //  Serial.print(pos.elevation, numDigits);
+  //  Serial.print(F(" deg\t"));
+  //
+  //  Serial.print(F(" Calculated azimuth: "));
+  //  Serial.print(pos.azimuth, numDigits);
+  //  Serial.println(F(" deg"));
+}
+/**********************************************************************************************
+   This is reading the Temperature and humidity
+ ************************************************************************************************/
+void Read_DHT22() {
+  //  Serial.println("Read_DHT22");
+  float hum = dht.readHumidity();
+  float temp = dht.readTemperature();
+  delay(100);
+  //Print temp and humidity values to serial monitor
+  //    Serial.print("Humidity: ");
+  //    Serial.print(hum);
+  //    Serial.print("\t");
+  //    Serial.print(" %, Temp: ");
+  //    Serial.print(temp);
+  //    Serial.println(" Celsius");
+}
+/**********************************************************************************************
+   This is initializing the SD Card
+ ************************************************************************************************/
+
+void Initialize_SDcard() {
+  // see if the card is present and can be initialized:
+  if (!SD.begin(chipSelect)) {
+    Serial.println("Card failed, or not present");
+    // don't do anything more:
+    return;
+  }
+  Serial.println("initalizing the SD Card....");
+  // open the file. note that only one file can be open at a time,
+  // so you have to close this one before opening another.
+  File dataFile = SD.open("LoggerCD.txt", FILE_WRITE);
+  // if the file is available, write to it:
+  if (dataFile) {
+    dataFile.println("Date , Time , Temperature , Humidity , Elevation , Azimuth, Pressure, Voltage In, Current In, Stationary Voltage, Stationary Current, Rotational Voltage, Rotational Current"); //Write the first row of the excel file
+    Serial.println("Header written on SD Card");
+    dataFile.close();
+
+  }
+  Serial.println("SD Card initalized");
+}
+/**********************************************************************************************
+     This is for recoding the various bits of data pressure, temperature, and such
+ ************************************************************************************************/
+void Write_SDcard() {
+  if (SD.begin(chipSelect)) {
+    // open the file. note that only one file can be open at a time,
+    // so you have to close this one before opening another.
+    File dataFile = SD.open("LoggerCD.txt", FILE_WRITE);
+    // if the file is available, write to it:
+    if (dataFile) {
+      SolarPosition_t SDSU_pos;
+      SDSU_pos = SDSU.getSolarPosition();
+      float azimuth = SDSU_pos.azimuth;
+      float elevation = SDSU_pos.elevation;
+      float m_el_pos = A.measured_elevation;
+      float m_azim_pos = A.measured_azimuth;
+      byte _second, _minute, _hour, dayOfWeek, dayOfMonth, _month, _year;
+      readDS3231time(&_second, &_minute, &_hour, &dayOfWeek, &dayOfMonth, &_month,
+                     &_year);
+
+      //    Serial.print("UTC: ");
+      //    Serial.print(_hour);
+      //    Serial.print(':');
+      //    Serial.print(_minute);
+      //    Serial.print(':');
+      //    Serial.print(_second);
+      //    Serial.print(", Date (D/M/Y) = ");
+      //    Serial.print(dayOfMonth);
+      //    Serial.print('/');
+      //    Serial.print(_month);
+      //    Serial.print('/');
+      //    Serial.print(_year);
+      //    Serial.println();
+
+
+      dataFile.print(dayOfMonth);
+      dataFile.print('/');
+      dataFile.print(_month);
+      dataFile.print('/');
+      dataFile.print(_year);
+      dataFile.print(",");
+
+      if (_hour < 10)
+      {
+        dataFile.print('0');
+        dataFile.print(_hour);
+      }
+      else {
+        dataFile.print(_hour);
+      }
+      dataFile.print(':');
+      if (_minute < 10)
+      {
+        dataFile.print('0');
+        dataFile.print(_minute);
+      }
+      else {
+        dataFile.print(_minute);
+      }
+
+      dataFile.print(':');
+      if (_second < 10)
+      {
+        dataFile.print('0');
+        dataFile.print(_second);
+      }
+      else {
+        dataFile.print(_second);
+      }
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(dht.readTemperature()); //Store date on SD card
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(dht.readHumidity()); //Store date on SD card
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(elevation, digits); //Sdsu solar position on SD card
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(azimuth, digits ); //Sdsu solar poasition on SD card
+      dataFile.print(","); //Move to next column using a comma
+
+
+      dataFile.print(m_el_pos, digits); //Sdsu solar position on SD card
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(m_azim_pos, digits ); //Sdsu solar poasition on SD card
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(Z.Pressure); //Pressure from BMP
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(B.voltage_12volt); //Voltage into the system from the wall
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(B.current_12volt); //Current into the system from the wall
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(B.voltage_stationary); //Voltage produced by the stationary panel
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(B.current_stationary); //Current produced by the stationary panel
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(B.voltage_rotational); //Voltage produced by the rotational panel
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.print(B.current_rotational); //Current produced by the rotational panel
+      dataFile.print(","); //Move to next column using a comma
+
+      dataFile.println(); //End of Row move to next row
+      dataFile.close(); //Close the file
+    }
+  }
+  //This is if the SD card is take  out it should try to reinitalize the  SD card
+  else if (!SD.begin(chipSelect)) {
+    Serial.println("SD card failed or not present, trying to re-initalize");
+    Initialize_SDcard();
+  }
+
+}
+
+void print2digits(int number) {
+  if (number >= 0 && number < 10) {
+    Serial.write('0');
+  }
+  Serial.print(number);
+}
+/**********************************************************************************************
+    This calculates the sun's poition
+ ************************************************************************************************/
+void Solar_position() {
+  //Serial.println("This is in Solar_position function");
+  printSolarPosition(SDSU.getSolarPosition(), digits);
+  //delay(2000); //Wait for 2 seconds before writing the next data
+}
+/**********************************************************************************************
+    This uses the GPS time to update the RTC time
+************************************************************************************************/
+void updateRTC() {
+  int count = 0;
+  unsigned long timer; //Time out. This could actually be annoying.
+  int error = 0; // no data counter.
+  byte a = 0; // "..." line counter
+  bool updated = 0; // do, while flag.
+  Serial.println("Finding GPS data");
+  Serial.println("...");
+  delay(500); // give the GPS a little time to sort itself out
+  //Do the GPS thing until timeout or success.
+  do {
+    while (Serial1.available() > 0) //read GPS data
+      gps.encode(Serial1.read());
+    //if both time and date are ready, set the time.
+    if (gps.time.isUpdated() && gps.date.isUpdated()) {
+      byte Year = gps.date.year();
+      byte Month = gps.date.month();
+      byte Day = gps.date.day();
+      byte Hour = gps.time.hour();
+      byte Minute = gps.time.minute();
+      byte Second = gps.time.second();
+
+      setTime(Hour, Minute, Second, Day, Month, Year);
+      // rtc.setDate(Day, Month, Year);
+      adjustTime(TIMEZONE * SECS_PER_HOUR); //Set time to current timezone
+      //Set the RTC to GPS time.
+      if (1) { // Enter if conditions to confirm update. Too lazy.
+        Wire.beginTransmission(DS3231_I2C_ADDRESS);
+        Wire.write(0); // set next input to start at the seconds register
+        Wire.write(decToBcd(second())); // set seconds
+        Wire.write(decToBcd(minute()));  // set minutes
+        Wire.write(decToBcd(hour())); // set hours
+        Wire.write(decToBcd(weekday())); // set day of week (1=Sunday, 7=Saturday)
+        Wire.write(decToBcd(day())); // set date (1 to 31)
+        Wire.write(decToBcd(month())); // set month
+        Wire.write(decToBcd(year() - 2000));//-2000 to return only last 2 year digits for RTC. I'll be dead long before this matters.
+        Wire.endTransmission();
+        Serial.println();
+        Serial.println ("RTC Updated!");
+      }
+      updated = 1; //update flag true to break while loop
+      //spew out the GPS time
+      Serial.println();
+      Serial.println("GPS TIME");
+      Serial.print(hour());
+      Serial.print(":");
+      if (minute() < 10)
+      {
+        Serial.print("0");
+      }
+      Serial.print(minute());
+      Serial.print(":");
+      if (second() < 10)
+      {
+        Serial.print("0");
+      }
+      Serial.print(second());
+      Serial.print(" ");
+      Serial.print(day());
+      Serial.print("/");
+      Serial.print(month());
+      Serial.print("/");
+      Serial.print(year());
+      Serial.print(" Day of week: ");
+      Serial.print(weekday());
+      Serial.print(" ");
+      switch (weekday()) {
+        case 1:
+          Serial.println("Sunday");
+          break;
+        case 2:
+          Serial.println("Monday");
+          break;
+        case 3:
+          Serial.println("Tuesday");
+          break;
+        case 4:
+          Serial.println("Wednesday");
+          break;
+        case 5:
+          Serial.println("Thursday");
+          break;
+        case 6:
+          Serial.println("Friday");
+          break;
+        case 7:
+          Serial.println("Saturday");
+          break;
+      }
+      //Retrive the updated RTC Time.
+      byte _second, _minute, _hour, dayOfWeek, dayOfMonth, _month, _year;
+      readDS3231time(&_second, &_minute, &_hour, &dayOfWeek, &dayOfMonth, &_month,
+                     &_year);
+      //Generate checksums. Could be better. But who cares it's good enough for me.
+      rtcChkSum = _second + _minute + _hour + dayOfWeek + dayOfMonth + _month + _year;
+      gpsChkSum = second() + minute() + hour() + weekday() + day() + month() + year() - 2000;
+      // Spew the RTC time
+      Serial.println();
+      Serial.println("RTC TIME");
+      Serial.print(_hour, DEC);
+      Serial.print(":");
+      if (_minute < 10)
+      {
+        Serial.print("0");
+      }
+      Serial.print(_minute, DEC);
+      Serial.print(":");
+      if (_second < 10)
+      {
+        Serial.print("0");
+      }
+      Serial.print(_second, DEC);
+      Serial.print(" ");
+      Serial.print(dayOfMonth, DEC);
+      Serial.print("/");
+      Serial.print(_month, DEC);
+      Serial.print("/");
+      Serial.print(_year + 2000, DEC);
+      Serial.print(" Day of week: ");
+      Serial.print(dayOfWeek);
+      Serial.print(" ");
+      switch (dayOfWeek) {
+        case 1:
+          Serial.println("Sunday");
+          break;
+        case 2:
+          Serial.println("Monday");
+          break;
+        case 3:
+          Serial.println("Tuesday");
+          break;
+        case 4:
+          Serial.println("Wednesday");
+          break;
+        case 5:
+          Serial.println("Thursday");
+          break;
+        case 6:
+          Serial.println("Friday");
+          break;
+        case 7:
+          Serial.println("Saturday");
+          break;
+      }
+    }
+    else {
+      if (gps.charsProcessed() < 10) {
+        Serial.println(("WARNING: No GPS data"));
+        if (error > 10) {
+          Serial.println("Clearly something is wrong. Check wiring or go outside");
+          error = 0;
+          delay(1000);
+        }
+        Serial.println("Finding GPS data");
+        delay(500);
+        error++;
+      }
+      else {
+        if (a == 0) {
+          Serial.println("GPS found");
+          timer = millis();
+        }
+        Serial.print("...");
+        a++;
+        if (a > 15) {
+          Serial.println();
+          a = 1;
+        }
+      }
+    }
+
+  }
+  while (!updated);
+
+}
+
+byte decToBcd(byte val)
+{
+  return ( (val / 10 * 16) + (val % 10) );
+}
+// Convert binary coded decimal to normal decimal numbers
+byte bcdToDec(byte val)
+{
+  return ( (val / 16 * 10) + (val % 16) );
+}
+
+//Get time from RTC
+void readDS3231time(byte * second,
+                    byte * minute,
+                    byte * hour,
+                    byte * dayOfWeek,
+                    byte * dayOfMonth,
+                    byte * month,
+                    byte * year)
+{
+  Wire.beginTransmission(DS3231_I2C_ADDRESS);
+  Wire.write(0); // set DS3231 register pointer to 00h
+  Wire.endTransmission();
+  Wire.requestFrom(DS3231_I2C_ADDRESS, 7);
+  // request seven bytes of data from DS3231 starting from register 00h
+  *second = bcdToDec(Wire.read() & 0x7f);
+  *minute = bcdToDec(Wire.read());
+  *hour = bcdToDec(Wire.read() & 0x3f);
+  *dayOfWeek = bcdToDec(Wire.read());
+  *dayOfMonth = bcdToDec(Wire.read());
+  *month = bcdToDec(Wire.read());
+  *year = bcdToDec(Wire.read());
+}
+/**********************************************************************************************
+     This controls the measuring of the panel position against the calculated sun position and moves the elevation to match
+ ************************************************************************************************/
+void elevation_Position_feedback() {
+  //Serial.println("in the Position_feedback ");
+  SolarPosition_t SDSU_pos;
+  SDSU_pos = SDSU.getSolarPosition();
+  float azim = SDSU_pos.azimuth;//calculated azimuth positions
+  float elev = SDSU_pos.elevation; //calcualted elevation position
+  float m_el_pos = A.measured_elevation;
+  float m_azim_pos = A.measured_azimuth;
+  int threshold = 3;
+  int min_contraction = 15;
+      Serial.print("Measured el position=   ");
+      Serial.print(m_el_pos);
+      Serial.print("\t");
+      Serial.print("calc elev= ");
+      Serial.print(elev);
+      Serial.print("\t");
+      Serial.print("Elevation Threshold= ");
+      Serial.print(m_el_pos-elev);
+      Serial.print("\t");
+  /*fully contracted the solar panel faces 34 degrees elevation and 84 degrees azimuth this is the morning position
+    sunset position  38 elevation and 257 azimuth
+  */
+
+  if (elev > 0) { //if the calculated sun position is above the horizon...
+    if (m_el_pos > elev && (abs(m_el_pos - elev)) > threshold) { //if the measured elevation is greater than the calculaed elevation turn on RPWM which contracts the actuator, and tilts the panel down toward 0 degrees
+            Serial.print("Measured elevation > Calculated Elevation");
+            Serial.print("Elevation Threshold= ");
+            Serial.print(m_el_pos-elev);
+            Serial.print("\t");
+
+      analogWrite(Elev_LPWM_Output, 0);
+      analogWrite(Elev_RPWM_Output, 64);
+      delay(500);
+      analogWrite(Elev_RPWM_Output, 0);
+      analogWrite(Elev_LPWM_Output, 0);
+
+
+    }
+    else if (m_el_pos < elev && (abs(m_el_pos - elev)) > threshold) { //if the measured elevation is Less than the calculaed elevation turn on LPWM which extends the actuator, and tilts the panel up toward 90 degrees
+      // Serial.println("Measured elevation < Calculated Elevation");
+      analogWrite(Elev_LPWM_Output, 64);
+      analogWrite(Elev_RPWM_Output, 0);
+      delay(500);
+      analogWrite(Elev_LPWM_Output, 0);
+      analogWrite(Elev_RPWM_Output, 0);
+    }
+
+  }
+  else if (elev < 0) { //if the sun is below the horizon
+
+    if (elev < 0 && m_el_pos > 45 && m_azim_pos >= 90) { //the sun has set or has not come up yet --->go to morning position
+      analogWrite(Elev_LPWM_Output, 100);
+      analogWrite(Elev_RPWM_Output, 0);
+      delay(1000);
+      analogWrite(Elev_LPWM_Output, 0);
+      analogWrite(Elev_RPWM_Output, 0);
+    }
+    if (elev < 0 && m_el_pos < 40 && m_azim_pos < 90) { //the sun has set or has not come up yet, and the measured elevation position is below 40,and measured azimuth is at morning position: dont move since this is the physical limitation of the system
+      analogWrite(Elev_LPWM_Output, 0);
+      analogWrite(Elev_RPWM_Output, 0);
+      delay(500);
+      analogWrite(Azi_LPWM_Output, 0);
+      analogWrite(Azi_RPWM_Output, 0);
+    }
+
+  }
+}
+/**********************************************************************************************
+    This controls the measuring of the panel position against the calculated sun position and moves the Azimuth to match
+************************************************************************************************/
+void Azimuth_Position_feedback() {
+  //Serial.println("in the Position_feedback ");
+  SolarPosition_t SDSU_pos;
+  SDSU_pos = SDSU.getSolarPosition();
+  float elev = SDSU_pos.elevation; //calcualted elevation position
+  float azim = SDSU_pos.azimuth;//calculated azimuth positions
+  float m_el_pos = A.measured_elevation;
+  float m_azim_pos = A.measured_azimuth;
+  int threshold = 4;
+      Serial.print("Measured Az position= ");
+      Serial.print(m_azim_pos);
+      Serial.print("\t");
+      Serial.print("calc azimuth= ");
+      Serial.print(azim);
+      Serial.print("\t");
+      Serial.print("Azimuth Threshold= ");
+      Serial.print(m_azim_pos-azim);
+      Serial.println("\t");
+  /*fully contracted the solar panel faces 34 degrees elevation and 84 degrees azimuth this is the morning position
+    sunset position  38 elevation and 257 azimuth
+  */
+  if (elev < 0) // if sun is below the horizon
+  {
+    if (m_el_pos < 40 && m_azim_pos < 90)
+    { //the sun has set or has not come up yet, and the measured elevation position is below 40,and measured azimuth is at morning position: dont move since this is the physical limitation of the system
+      analogWrite(Elev_LPWM_Output, 0);
+      analogWrite(Elev_RPWM_Output, 0);
+      delay(1000);
+      analogWrite(Azi_LPWM_Output, 0);
+      analogWrite(Azi_RPWM_Output, 0);
+    }
+    if (m_azim_pos > 90)
+    { //the sun has set or has not come up yet --->go to morning position
+      analogWrite(Azi_RPWM_Output, 100); //RPWM which contracts the actuator which pulls it toward East morning sun
+      analogWrite(Azi_LPWM_Output, 0);
+      delay(1000);
+      analogWrite(Azi_LPWM_Output, 0);
+      analogWrite(Azi_RPWM_Output, 0);
+    }
+    else if (m_azim_pos <= 90)
+    {
+      analogWrite(Azi_RPWM_Output, 0); //This is to stop the actuator from continuing to try and move once it reaches the physical actator limit
+      analogWrite(Azi_LPWM_Output, 0);
+    }
+  }
+  else if (elev > 0) //if the sun is above the horizon
+  {
+    if (m_azim_pos < azim && (abs(m_azim_pos - azim)) > threshold ) //if the measured position is less than the calculated position extend the actuator to move the panel west
+    {
+      //        Serial.println("Measured Azimuth < Calculated Azimuth");
+      analogWrite(Azi_RPWM_Output, 0);
+      analogWrite(Azi_LPWM_Output, 64); //LPWM which extends the actuator which pushes it toward West eavening sun
+      delay(500);
+      analogWrite(Azi_RPWM_Output, 0); //shut off the movement to assess the panels position
+      analogWrite(Azi_LPWM_Output, 0);
+    }
+    else if (m_azim_pos > azim && (abs(m_azim_pos - azim)) > threshold)
+    {
+      //      Serial.println("Measured Azimuth > Calculated Azimuth");
+      analogWrite(Azi_RPWM_Output, 64); //RPWM which contracts the actuator which pulls it toward East morning sun
+      analogWrite(Azi_LPWM_Output, 0);
+      delay(500);
+      analogWrite(Azi_LPWM_Output, 0);
+      analogWrite(Azi_RPWM_Output, 0);
+    }
+    else if (m_azim_pos >= 243) //This is the measured physical stop of the azimuth actuator so this stops the actuator from trying to actuate
+    {
+      analogWrite(Azi_LPWM_Output, 0);
+      analogWrite(Azi_RPWM_Output, 0);
+    }
+  }
+}
+/**********************************************************************************************
+     This Turns off the actuators so they dont move if the stop button is pressed
+ ************************************************************************************************/
+void E_STOP() {
+  Stop_button = digitalRead(STOP);
+  if (Stop_button == LOW) { //when HIGH the motor drivers are turned on
+    digitalWrite(Azi_R_EN, HIGH);
+    digitalWrite(Azi_L_EN, HIGH);
+    digitalWrite(Elev_R_EN, HIGH);
+    digitalWrite(Elev_L_EN, HIGH);
+
+  }
+  else if (Stop_button == HIGH) { //when LOW the motor drivers are turned off
+    digitalWrite(Azi_R_EN, LOW);
+    digitalWrite(Azi_L_EN, LOW);
+    digitalWrite(Elev_R_EN, LOW);
+    digitalWrite(Elev_L_EN, LOW);
+    analogWrite(Azi_LPWM_Output, 0);
+    analogWrite(Azi_RPWM_Output, 0);
+    analogWrite(Elev_LPWM_Output, 0);
+    analogWrite(Elev_RPWM_Output, 0);
+    Serial.println("EMERGENCY STOP BUTTON PRESSED");
+  }
+}
+
+void setup() {
+  // Setup Serial connection
+  Serial.begin(9600);
+  Serial1.begin (9600);
+  pressure.begin();
+  dht.begin();
+  updateRTC(); // Gather data, update.
+  Serial.println();
+  Serial.print("Checksum: GPS: ");
+  Serial.print(gpsChkSum);
+  Serial.print(" RTC: ");
+  Serial.println(rtcChkSum);
+  if (rtcChkSum == gpsChkSum) {
+    Serial.println("Sucess!");
+  }
+  else {
+    Serial.println("Error. Checksum missmatch. Time Incorrect"); // Self explanatory.
+  }
+  SolarPosition::setTimeProvider(RTC.get);// used with the solar position library to get the time
+  Initialize_SDcard();// initalizing the SD card for data logging
+  dht.begin();//start talking with the DHT
+
+
+  // This setup is for the Tilt sensor
+  pinMode(A0, OUTPUT);
+  pinMode(A4, OUTPUT);
+  digitalWrite(A0, HIGH);
+  digitalWrite(A4, LOW);
+  //This is the setup for the motor drivers
+  pinMode(Elev_R_EN, OUTPUT);//This sets the pin to turn on for elevator right
+  pinMode(Elev_L_EN, OUTPUT);//This sets the pin to turn on for elevator left
+  digitalWrite(Elev_R_EN, HIGH); //This just turns the pin on so the motor driver can actually actuate
+  digitalWrite(Elev_L_EN, HIGH); //This just turns the pin on so the motor driver can actually actuate
+  pinMode(Elev_RPWM_Output, OUTPUT);//This sets the pin to PWM so it can vary the speed of the motor driver
+  pinMode(Elev_LPWM_Output, OUTPUT);//This sets the pin to PWM so it can vary the speed of the motor driver
+
+  pinMode(Azi_R_EN, OUTPUT);
+  pinMode(Azi_L_EN, OUTPUT);
+  digitalWrite(Azi_R_EN, HIGH);
+  digitalWrite(Azi_L_EN, HIGH);
+  pinMode(Azi_RPWM_Output, OUTPUT);
+  pinMode(Azi_LPWM_Output, OUTPUT);
+
+  pinMode(STOP, INPUT);//pin 23 just to totally stop the system from moving so components dont get damaged
+  /* 3- DC Power Wattage calculation */
+
+  startMillisPower12volt = millis();
+
+  /* 4- DC Watt-hour calculation */
+
+  startMillisEnergy12volt = millis();
+
+}
+void voltmeter12volt() {
+
+
+  /* 1- DC Voltage Measurement using Voltage Divider Method */
+  //Serial.print("millis= ");
+  //Serial.print(millis());
+  //struct POWER{
+  //  float voltage_12volt;
+  //  float current_12volt;
+  //
+  //  float voltage_stationary;
+  //  float current_stationary;
+  //
+  //  float voltage_rotational;
+  //  float current_rotational;
+  //};
+  //struct POWER B;
+
+
+  if (millis() >= voltageLastSample12volt + 1 )                                                              /* every 1 milli second taking 1 reading */
+  {
+    voltageSampleRead12volt = analogRead(volt_voltage);                                                    /* read the sample value */
+    //            Serial.print("voltageSampleSum12volt: ");
+    //            Serial.print( voltageSampleSum12volt);
+    //            Serial.print("\t");
+    voltageSampleSum12volt = voltageSampleSum12volt + voltageSampleRead12volt ;                                         /* accumulate value with older sample readings*/
+    voltageSampleCount12volt = voltageSampleCount12volt + 1;                                                       /* to move on to the next following count */
+    //            Serial.print("voltageSampleCount12volt: ");
+    //            Serial.print( voltageSampleCount12volt);
+    divide = (voltageSampleSum12volt / voltageSampleCount12volt);
+    //            Serial.print("\t");
+    //            Serial.print("divide: ");
+    //            Serial.println(divide);
+    voltageLastSample12volt = millis();                                                                    /* to reset the time again so that next cycle can start again*/
+  }
+
+  if (voltageSampleCount12volt == 10)                                                                       /* after 1000 count or 1000 milli seconds (1 second), do the codes below*/
+  {
+    voltageMean12volt = voltageSampleSum12volt / voltageSampleCount12volt;                                              /* calculate average value of all sample readings taken*/
+    // finalVoltage12volt = (((voltageMean12volt/1024) / (R2/(R1+R2)))*moduleSupplyVoltageV12volt);
+    finalVoltage12volt = (((voltageMean12volt / 1024)) * moduleSupplyVoltageV12volt);                                   /*  Calculate the expected monitoring votlage */
+    Serial.print("12 V : ");
+    Serial.print( finalVoltage12volt, decimalPrecision);
+    Serial.print(" V ");
+    Serial.print(" /  ");
+    voltageSampleSum12volt = 0;                                                                             /* to reset accumulate sample values for the next cycle */
+    voltageSampleCount12volt = 0;                                                                           /* to reset number of sample for the next cycle */
+    B.voltage_12volt = (finalVoltage12volt, decimalPrecision);
+  }
+
+
+  /* 2- DC Current Measurement */
+
+  if (millis() >= currentLastSample12volt + 1 )                                                               /* every 1 milli second taking 1 reading */
+  {
+    currentSampleRead12volt = analogRead(volt_current) - ((moduleMiddleVoltage / moduleSupplyVoltage) * 1024); /* read the sample value */
+    currentSampleSum12volt = currentSampleSum12volt + currentSampleRead12volt ;                                         /* accumulate value with older sample readings*/
+ 
+    currentSampleCount12volt = currentSampleCount12volt + 1;                                                      /* to move on to the next following count */
+    currentLastSample12volt = millis();                                                                     /* to reset the time again so that next cycle can start again*/
+  }
+
+  if (currentSampleCount12volt == 10)                                                                       /* after 1000 count or 1000 milli seconds (1 second), do the calculation and display value*/
+  {
+    currentMean12volt = currentSampleSum12volt / currentSampleCount12volt;                                        /* calculate average value of all sample readings taken*/
+    finalCurrent12volt = (((currentMean12volt / 1024) * 5000) / mVperAmpValue);                                   /* calculate the final RMS current*/
+    finalCurrent212volt = finalCurrent12volt + currentOffset12volt;
+    Serial.print("12V I : ");
+    Serial.print(finalCurrent212volt, decimalPrecision);
+    Serial.print(" A ");
+    Serial.println(" /  ");
+    currentSampleSum12volt = 0;                                                                             /* to reset accumulate sample values for the next cycle */
+    currentSampleCount12volt = 0;                                                                           /* to reset number of sample for the next cycle */
+    B.current_12volt = (finalCurrent212volt, decimalPrecision);
+  }
+
+
+  /* 2.1 - Offset DC Current */
+
+  if (OffsetRead12volt == 1)
+  {
+    currentOffset12volt = 0;                                                              /* set back currentOffset as default*/
+    if (millis() >= offsetLastSample12volt + 1)                                         /* offset 1 - to centralise analogRead waveform*/
+    {
+      offsetSampleCount12volt = offsetSampleCount12volt + 1;
+      offsetLastSample12volt = millis();
+    }
+
+    if (offsetSampleCount12volt == 2500)                                             /* need to wait first offset take into effect. Delay 2.5 seconds  */
+    { /* So this code is to delay 2.5 seconds after button pressed */
+      currentOffset12volt = - finalCurrent12volt;                                            /* to offset values */
+      OffsetRead12volt = 0;                                                            /* until next offset button is pressed*/
+      offsetSampleCount12volt = 0;                                                     /* to reset the time again so that next cycle can start again */
+    }
+  }
+
+
+  /* 3- DC Power Wattage calculation */
+
+  currentMillisPower12volt = millis();                                                                            /* Count the time for power */
+  if (currentMillisPower12volt - startMillisPower12volt >= periodPower12volt)
+  {
+    PowerValue12volt = finalCurrent212volt * finalVoltage12volt;
+    //            Serial.print("P : " );
+    //            Serial.print(PowerValue,decimalPrecision);
+    //            Serial.print(" W ");
+    //            Serial.print(" /  ");
+    startMillisPower12volt = currentMillisPower12volt ;                                                               /* Set the starting point again for next counting time */
+  }
+
+  /* 4- DC Watt-hour calculation */
+
+  currentMillisEnergy12volt = millis();                                                                            /* Count the time for current */
+  if (currentMillisEnergy12volt - startMillisEnergy12volt >= periodEnergy12volt)
+  {
+    wattHour12volt = PowerValue12volt / 3600 * (periodEnergy12volt / 1000);                                                 /* for smoothing calculation*/
+    FinalEnergyValue12volt = FinalEnergyValue12volt + wattHour12volt;
+    //            Serial.print("E : " );
+    //            Serial.print(FinalEnergyValue,decimalPrecision);
+    //            Serial.print(" Wh ");
+    //            Serial.println(" /  ");
+    startMillisEnergy12volt = currentMillisEnergy12volt ;                                                             /* Set the starting point again for next counting time */
+  }
+}
+
+void voltmeter_stationary() {
+
+  /* 1- DC Voltage Measurement using Voltage Divider Method */
+  //Serial.print("millis= ");
+  //Serial.print(millis());
+  if (millis() >= voltageLastSample_stationary + 1 )                                                              /* every 1 milli second taking 1 reading */
+  {
+    voltageSampleRead_stationary = analogRead(stationary_voltage);                                                    /* read the sample value */
+    //            Serial.print("voltageSampleSum_stationary: ");
+    //            Serial.print( voltageSampleSum_stationary);
+    //            Serial.print("\t");
+    voltageSampleSum_stationary = voltageSampleSum_stationary + voltageSampleRead_stationary ;                                         /* accumulate value with older sample readings*/
+    voltageSampleCount_stationary = voltageSampleCount_stationary + 1;                                                       /* to move on to the next following count */
+    //            Serial.print("voltageSampleCount_stationary: ");
+    //            Serial.print( voltageSampleCount_stationary);
+    divide = (voltageSampleSum_stationary / voltageSampleCount_stationary);
+    //            Serial.print("\t");
+    //            Serial.print("divide: ");
+    //            Serial.println(divide);
+    voltageLastSample_stationary = millis();                                                                    /* to reset the time again so that next cycle can start again*/
+  }
+
+  if (voltageSampleCount_stationary == 10)                                                                       /* after 1000 count or 1000 milli seconds (1 second), do the codes below*/
+  {
+    voltageMean_stationary = voltageSampleSum_stationary / voltageSampleCount_stationary;                                              /* calculate average value of all sample readings taken*/
+    // finalVoltage_stationary = (((voltageMean_stationary/1024) / (R2/(R1+R2)))*moduleSupplyVoltageV_stationary);
+    finalVoltage_stationary = (((voltageMean_stationary / 1024)) * moduleSupplyVoltageV_stationary);                                   /*  Calculate the expected monitoring votlage */
+    Serial.print("Sta V : ");
+    Serial.print( finalVoltage_stationary, decimalPrecision);
+    Serial.print(" V ");
+    Serial.print(" /  ");
+    voltageSampleSum_stationary = 0;                                                                             /* to reset accumulate sample values for the next cycle */
+    voltageSampleCount_stationary = 0;                                                                           /* to reset number of sample for the next cycle */
+    B.voltage_stationary = (finalVoltage_stationary, decimalPrecision);
+  }
+
+
+  /* 2- DC Current Measurement */
+
+  if (millis() >= currentLastSample_stationary + 1 )                                                               /* every 1 milli second taking 1 reading */
+  {
+    currentSampleRead_stationary = analogRead(stationary_current) - ((moduleMiddleVoltage / moduleSupplyVoltage) * 1024); /* read the sample value */
+    currentSampleSum_stationary = currentSampleSum_stationary + currentSampleRead_stationary ;                                         /* accumulate value with older sample readings*/
+    currentSampleCount_stationary = currentSampleCount_stationary + 1;                                                      /* to move on to the next following count */
+    currentLastSample_stationary = millis();                                                                     /* to reset the time again so that next cycle can start again*/
+  }
+
+  if (currentSampleCount_stationary == 10)                                                                       /* after 1000 count or 1000 milli seconds (1 second), do the calculation and display value*/
+  {
+    currentMean_stationary = currentSampleSum_stationary / currentSampleCount_stationary;                                              /* calculate average value of all sample readings taken*/
+    finalCurrent_stationary = (((currentMean_stationary / 1024) * 5000) / mVperAmpValue);                                   /* calculate the final RMS current*/
+    finalCurrent2_stationary = finalCurrent_stationary + currentOffset_stationary;
+    Serial.print("I : ");
+    Serial.print(finalCurrent2_stationary, decimalPrecision);
+    Serial.print(" A ");
+    Serial.println(" /  ");
+    currentSampleSum_stationary = 0;                                                                             /* to reset accumulate sample values for the next cycle */
+    currentSampleCount_stationary = 0;                                                                           /* to reset number of sample for the next cycle */
+    B.current_stationary = (finalCurrent2_stationary, decimalPrecision);
+  }
+
+
+  /* 2.1 - Offset DC Current */
+
+  if (OffsetRead_stationary == 1)
+  {
+    currentOffset_stationary = 0;                                                              /* set back currentOffset as default*/
+    if (millis() >= offsetLastSample_stationary + 1)                                         /* offset 1 - to centralise analogRead waveform*/
+    {
+      offsetSampleCount_stationary = offsetSampleCount_stationary + 1;
+      offsetLastSample_stationary = millis();
+    }
+
+    if (offsetSampleCount_stationary == 2500)                                             /* need to wait first offset take into effect. Delay 2.5 seconds  */
+    { /* So this code is to delay 2.5 seconds after button pressed */
+      currentOffset_stationary = - finalCurrent_stationary;                                            /* to offset values */
+      OffsetRead_stationary = 0;                                                            /* until next offset button is pressed*/
+      offsetSampleCount_stationary = 0;                                                     /* to reset the time again so that next cycle can start again */
+    }
+  }
+
+
+  /* 3- DC Power Wattage calculation */
+
+  currentMillisPower_stationary = millis();                                                                            /* Count the time for power */
+  if (currentMillisPower_stationary - startMillisPower_stationary >= periodPower_stationary)
+  {
+    PowerValue_stationary = finalCurrent2_stationary * finalVoltage_stationary;
+    //            Serial.print("P : " );
+    //            Serial.print(PowerValue,decimalPrecision);
+    //            Serial.print(" W ");
+    //            Serial.print(" /  ");
+    startMillisPower_stationary = currentMillisPower_stationary ;                                                               /* Set the starting point again for next counting time */
+  }
+
+  /* 4- DC Watt-hour calculation */
+
+  currentMillisEnergy_stationary = millis();                                                                            /* Count the time for current */
+  if (currentMillisEnergy_stationary - startMillisEnergy_stationary >= periodEnergy_stationary)
+  {
+    wattHour_stationary = PowerValue_stationary / 3600 * (periodEnergy_stationary / 1000);                                                 /* for smoothing calculation*/
+    FinalEnergyValue_stationary = FinalEnergyValue_stationary + wattHour_stationary;
+    //            Serial.print("E : " );
+    //            Serial.print(FinalEnergyValue,decimalPrecision);
+    //            Serial.print(" Wh ");
+    //            Serial.println(" /  ");
+    startMillisEnergy_stationary = currentMillisEnergy_stationary ;                                                             /* Set the starting point again for next counting time */
+  }
+}
+
+void voltmeter_rotational() {
+
+  /* 1- DC Voltage Measurement using Voltage Divider Method */
+  //Serial.print("millis= ");
+  //Serial.print(millis());
+  if (millis() >= voltageLastSample_rotational + 1 )                                                              /* every 1 milli second taking 1 reading */
+  {
+    voltageSampleRead_rotational = analogRead(rotational_voltage);                                                    /* read the sample value */
+    //            Serial.print("voltageSampleSum_rotational: ");
+    //            Serial.print( voltageSampleSum_rotational);
+    //            Serial.print("\t");
+    voltageSampleSum_rotational = voltageSampleSum_rotational + voltageSampleRead_rotational ;                                         /* accumulate value with older sample readings*/
+    voltageSampleCount_rotational = voltageSampleCount_rotational + 1;                                                       /* to move on to the next following count */
+    //            Serial.print("voltageSampleCount_rotational: ");
+    //            Serial.print( voltageSampleCount_rotational);
+    divide = (voltageSampleSum_rotational / voltageSampleCount_rotational);
+    //            Serial.print("\t");
+    //            Serial.print("divide: ");
+    //            Serial.println(divide);
+    voltageLastSample_rotational = millis();                                                                    /* to reset the time again so that next cycle can start again*/
+  }
+
+  if (voltageSampleCount_rotational == 10)                                                                       /* after 1000 count or 1000 milli seconds (1 second), do the codes below*/
+  {
+    voltageMean_rotational = voltageSampleSum_rotational / voltageSampleCount_rotational;                                              /* calculate average value of all sample readings taken*/
+    // finalVoltage_rotational = (((voltageMean_rotational/1024) / (R2/(R1+R2)))*moduleSupplyVoltageV_rotational);
+    finalVoltage_rotational = (((voltageMean_rotational / 1024)) * moduleSupplyVoltageV_rotational);                                   /*  Calculate the expected monitoring votlage */
+    Serial.print("Rot V : ");
+    Serial.print( finalVoltage_rotational, decimalPrecision);
+    Serial.print(" V ");
+    Serial.print(" /  ");
+    voltageSampleSum_rotational = 0;                                                                             /* to reset accumulate sample values for the next cycle */
+    voltageSampleCount_rotational = 0;                                                                           /* to reset number of sample for the next cycle */
+    B.voltage_rotational = (finalVoltage_rotational, decimalPrecision);
+  }
+
+
+  /* 2- DC Current Measurement */
+
+  if (millis() >= currentLastSample_rotational + 1 )                                                               /* every 1 milli second taking 1 reading */
+  {
+    currentSampleRead_rotational = analogRead(rotational_current) - ((moduleMiddleVoltage / moduleSupplyVoltage) * 1024); /* read the sample value */
+    currentSampleSum_rotational = currentSampleSum_rotational + currentSampleRead_rotational ;                                         /* accumulate value with older sample readings*/
+    currentSampleCount_rotational = currentSampleCount_rotational + 1;                                                      /* to move on to the next following count */
+    currentLastSample_rotational = millis();                                                                     /* to reset the time again so that next cycle can start again*/
+  }
+
+  if (currentSampleCount_rotational == 10)                                                                       /* after 1000 count or 1000 milli seconds (1 second), do the calculation and display value*/
+  {
+    currentMean_rotational = currentSampleSum_rotational / currentSampleCount_rotational;                                              /* calculate average value of all sample readings taken*/
+    finalCurrent_rotational = (((currentMean_rotational / 1024) * 5000) / mVperAmpValue);                                   /* calculate the final RMS current*/
+    finalCurrent2_rotational = finalCurrent_rotational + currentOffset_rotational;
+    Serial.print("I : ");
+    Serial.print(finalCurrent2_rotational, decimalPrecision);
+    Serial.print(" A ");
+    Serial.println(" /  ");
+    currentSampleSum_rotational = 0;                                                                             /* to reset accumulate sample values for the next cycle */
+    currentSampleCount_rotational = 0;                                                                           /* to reset number of sample for the next cycle */
+    B.current_rotational = (finalCurrent2_rotational, decimalPrecision);
+  }
+
+
+  /* 2.1 - Offset DC Current */
+
+  if (OffsetRead_rotational == 1)
+  {
+    currentOffset_rotational = 0;                                                              /* set back currentOffset as default*/
+    if (millis() >= offsetLastSample_rotational + 1)                                         /* offset 1 - to centralise analogRead waveform*/
+    {
+      offsetSampleCount_rotational = offsetSampleCount_rotational + 1;
+      offsetLastSample_rotational = millis();
+    }
+
+    if (offsetSampleCount_rotational == 2500)                                             /* need to wait first offset take into effect. Delay 2.5 seconds  */
+    { /* So this code is to delay 2.5 seconds after button pressed */
+      currentOffset_rotational = - finalCurrent_rotational;                                            /* to offset values */
+      OffsetRead_rotational = 0;                                                            /* until next offset button is pressed*/
+      offsetSampleCount_rotational = 0;                                                     /* to reset the time again so that next cycle can start again */
+    }
+  }
+
+
+  /* 3- DC Power Wattage calculation */
+
+  currentMillisPower_rotational = millis();                                                                            /* Count the time for power */
+  if (currentMillisPower_rotational - startMillisPower_rotational >= periodPower_rotational)
+  {
+    PowerValue_rotational = finalCurrent2_rotational * finalVoltage_rotational;
+    //            Serial.print("P : " );
+    //            Serial.print(PowerValue,decimalPrecision);
+    //            Serial.print(" W ");
+    //            Serial.print(" /  ");
+    startMillisPower_rotational = currentMillisPower_rotational ;                                                               /* Set the starting point again for next counting time */
+  }
+
+  /* 4- DC Watt-hour calculation */
+
+  currentMillisEnergy_rotational = millis();                                                                            /* Count the time for current */
+  if (currentMillisEnergy_rotational - startMillisEnergy_rotational >= periodEnergy_rotational)
+  {
+    wattHour_rotational = PowerValue_rotational / 3600 * (periodEnergy_rotational / 1000);                                                 /* for smoothing calculation*/
+    FinalEnergyValue_rotational = FinalEnergyValue_rotational + wattHour_rotational;
+    //            Serial.print("E : " );
+    //            Serial.print(FinalEnergyValue,decimalPrecision);
+    //            Serial.print(" Wh ");
+    //            Serial.println(" /  ");
+    startMillisEnergy_rotational = currentMillisEnergy_rotational ;                                                             /* Set the starting point again for next counting time */
+  }
+}
+
+void loop() {
+  Solar_position();
+  Read_accel();
+  Read_DHT22();
+  get_pressure_data();
+  elevation_Position_feedback();
+  Azimuth_Position_feedback();
+  E_STOP();
+  voltmeter12volt();// This was a panic input. im sure it could just be made into a function with the input arguments, but i ran out of time to do that.
+  voltmeter_rotational();
+  voltmeter_stationary();
+  // Write_SDcard();
+  if (firstTimer.isReady() && !flag) {            // Check is ready a first timer
+    Serial.println("one minute has passed, Writing to the SDCard");
+    Write_SDcard();
+
+    // Set the flag so as not to fall into this condition
+    flag = true;
+  }
+}
